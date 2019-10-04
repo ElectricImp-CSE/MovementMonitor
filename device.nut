@@ -24,6 +24,8 @@
 
 // Include Libraries
 #require "LIS3DH.device.lib.nut:2.0.3"
+#require "MAX17055.device.lib.nut:1.0.1"
+#require "BQ25895.device.lib.nut:3.0.0"
 #require "Messenger.lib.nut:0.1.0"
 #require "ConnectionManager.lib.nut:3.1.1"
 
@@ -55,6 +57,85 @@ FUEL_GAUGE_ADDR <- 0x6C;
 // Recommended for offline logging, remove when in production    
 LOGGING_UART    <- hardware.uartDCAB;
 
+
+// BATTERY   
+// --------------------------------------------------------------
+// Battery Monitoring File
+// NOTE: This class is currently written for a rechargable LiCoO2 battery.
+// Confirm settings before using.
+
+// Settings for a 3.7V 2000mAh battery from Adafruit and impC001 breakout
+const BATT_CHARGE_VOLTAGE = 4.2;
+const BATT_CURR_LIMIT     = 2000;
+const FG_DES_CAP          = 2000;   // mAh
+const FG_SENSE_RES        = 0.01;   // ohms
+const FG_CHARGE_TERM      = 20;     // mA
+const FG_EMPTY_V_TARGET   = 3.3;    // V
+const FG_RECOVERY_V       = 3.88;   // V
+// NOTE: Fuel gauge setting chrgV, battType are set using library constant,
+// please check these settings if updating these constants.
+
+const BATT_STATUS_CHECK_TIMEOUT = 0.5;
+
+// Manages Battery Monitoring
+// Dependencies: MAX17055, BQ25895 (may configure sensor i2c) Libraries
+// Initializes: MAX17055, BQ25895 Libraries
+class Battery {
+
+    charger = null;
+    fg      = null;
+
+    fgReady = null;
+
+    constructor(configureI2C) {
+        if (configureI2C) SENSOR_I2C.configure(CLOCK_SPEED_400_KHZ);
+
+        charger = BQ25895(SENSOR_I2C, BATT_CHGR_ADDR);
+        fg = MAX17055(SENSOR_I2C, FUEL_GAUGE_ADDR);
+
+        // Configure charger
+        charger.enable({"voltage": BATT_CHARGE_VOLTAGE, "current": BATT_CURR_LIMIT});
+
+        local fgSettings = {
+            "desCap"       : FG_DES_CAP,
+            "senseRes"     : FG_SENSE_RES,
+            "chrgTerm"     : FG_CHARGE_TERM,
+            "emptyVTarget" : FG_EMPTY_V_TARGET,
+            "recoveryV"    : FG_RECOVERY_V,
+            "chrgV"        : MAX17055_V_CHRG_4_2,
+            "battType"     : MAX17055_BATT_TYPE.LiCoO2
+        }
+        // NOTE: Full init will only run when "power on reset alert is detected",
+        // so call this here so ready flag is always set.
+        fg.init(fgSettings, function(err) {
+            if (err != null) {
+                ::error("[Battery] Error initializing fuel gauge: " + err);
+            } else {
+                fgReady = true;
+            }
+        }.bindenv(this));
+    }
+
+    function getStatus(cb = null) {
+        if (fgReady) {
+            if (cb == null) return fg.getStateOfCharge();
+            cb(fg.getStateOfCharge());
+        } else if (cb != null) {
+            imp.wakeup(BATT_STATUS_CHECK_TIMEOUT, function() {
+                getStatus(cb);
+            }.bindenv(this))
+        }
+    }
+
+    function checkStatus(thresh, cb) {
+        getStatus(function(soc) {
+            local status = soc;
+            status.battAlert <- (soc.percent <= thresh) ? ALERT_DESC.LOW : ALERT_DESC.IN_RANGE;
+            status.ts        <- time();
+            cb(status);
+        }.bindenv(this))
+    }
+}
 
 // MOTION   
 // --------------------------------------------------------------
@@ -195,8 +276,9 @@ const EVENT_REPORTING_INT_SEC  = 1;
 const MSG_ACK_TIMEOUT          = 10;
 // Retry message send after x seconds
 const MSG_RETRY_TIMEOUT        = 1.5;
-// Messenger reporting message name 
+// Messenger reporting message names 
 const MSGR_REPORT              = "report"; 
+const MSGR_BATT_STATUS         = "batt"; 
 
 // Dependencies: Motion class
 // Initializes: Motion
@@ -205,6 +287,7 @@ class Monitor {
     move               = null;
     msgr               = null;
     cm                 = null;
+    batt               = null;
     
     accelWindow        = null;
     stopSamplingTmr    = null;
@@ -235,6 +318,9 @@ class Monitor {
         // Initialized motion event detection
         move = Motion();
         move.enableInt(MOVEMENT_THRESHOLD, onMovement.bindenv(this));
+        
+        batt = Battery(false);
+        monitorBattery();
     }
     
     // Msgr handlers
@@ -294,7 +380,7 @@ class Monitor {
         }
     }
     
-    // Msgr handlers
+    // Asyc Action Handlers
     // -------------------------------------------------------------
     
     function onMovement() {
@@ -307,6 +393,14 @@ class Monitor {
         
         startMonitoringFor(MOVEMENT_SAMPLE_TIME_SEC);
     }
+    
+    function onAccelReading(r) {
+        accelWindow.append(r);
+        accelWindow.remove(0);
+    }
+    
+    // Monitoring Functions
+    // -------------------------------------------------------------
     
     function startMonitoringFor(monTime = MOVEMENT_SAMPLE_TIME_SEC) {
         // Toggle movemnt monitoring flag
@@ -329,19 +423,6 @@ class Monitor {
         reportTimer = imp.wakeup(EVENT_REPORTING_INT_SEC, sendReport.bindenv(this));
     }
     
-    function sendReport() {
-        // Create report
-        local report = getAvgAccel();
-        report.ts <- time();
-        
-        // Send to agent
-        server.log("[Monitor] Sending report to agent");
-        msgr.send(MSGR_REPORT, report);
-        
-        // Schedule next report
-        reportTimer = imp.wakeup(EVENT_REPORTING_INT_SEC, sendReport.bindenv(this));
-    }
-    
     function stopSampling() {
         server.log("-----------------------------------------------");
         server.log("[Monitor] Stopping accel sampling and reporting");
@@ -357,9 +438,17 @@ class Monitor {
         monitoringMovement = false;
     }
     
-    function onAccelReading(r) {
-        accelWindow.append(r);
-        accelWindow.remove(0);
+    function sendReport() {
+        // Create report
+        local report = getAvgAccel();
+        report.ts <- time();
+        
+        // Send to agent
+        server.log("[Monitor] Sending report to agent");
+        msgr.send(MSGR_REPORT, report);
+        
+        // Schedule next report
+        reportTimer = imp.wakeup(EVENT_REPORTING_INT_SEC, sendReport.bindenv(this));
     }
     
     function getAvgAccel() {
@@ -394,6 +483,17 @@ class Monitor {
         };
     }
     
+    function monitorBattery() {
+        batt.getStatus(function(soc) {
+            soc.ts <- time();
+            msgr.send(MSGR_BATT_STATUS, soc);
+            imp.wakeup(600, monitorBattery.bindenv(this));
+        }.bindenv(this));
+    }
+    
+    // Timer Helpers
+    // -------------------------------------------------------------   
+    
     function _cancelStopSamplingTimer() {
         if (stopSamplingTmr != null) {
             imp.cancelwakeup(stopSamplingTmr);
@@ -416,3 +516,4 @@ class Monitor {
 
 // Start application
 Monitor();
+

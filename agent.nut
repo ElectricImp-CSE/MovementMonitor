@@ -113,9 +113,10 @@ class Cloud {
 // Configures and Runs the Main Application  
 
 // Max time to wait for agent/device message ack
-const MSG_ACK_TIMEOUT = 10;
+const MSG_ACK_TIMEOUT  = 10;
 // Messenger reporting message name 
-const MSGR_REPORT     = "report"; 
+const MSGR_REPORT      = "report"; 
+const MSGR_BATT_STATUS = "batt"; 
 
 // Dependencies: Cloud
 // Initializes: Cloud
@@ -124,6 +125,9 @@ class Main {
     cloud = null;
     msgr  = null;
     
+    capturingEvent = false;
+    numEvents = 0;
+    
     constructor() {
         server.log("--------------------------------------------------------------------------");
         server.log("Agent started...");
@@ -131,6 +135,7 @@ class Main {
         
         msgr = Messenger({"ackTimeout" : MSG_ACK_TIMEOUT});
         msgr.on(MSGR_REPORT, onReport.bindenv(this));
+        msgr.on(MSGR_BATT_STATUS, onBatteryStatus.bindenv(this));
         
         cloud = Cloud();
     }
@@ -138,10 +143,60 @@ class Main {
     function onReport(payload, custAck) {
         local report = payload.data;
         
-        server.log("[Main] Report from device received: ");
+        server.log("[Main] Recieved report from device: ");
         server.log(http.jsonencode(report));
         
         cloud.send(report);
+        
+        if (!capturingEvent) {
+            capturingEvent = true;
+            numEvents++;
+            imp.wakeup(65, function() {capturingEvent = false}.bindenv(this));
+        }
+    }
+    
+    function onBatteryStatus(payload, custAck) {
+        local soc = payload.data;
+        
+        server.log("[Main] Recieved Battery Status from device: ");
+        server.log(http.jsonencode(soc));
+        
+        if (soc.percent < 10) {
+            server.log("------------------------");
+            server.log("[Main] LOW BATTERY ALERT");
+            server.log("[Main] Num Movement Events: " + numEvents);
+            server.log("------------------------");
+        }
+        
+        // Let application run for a day with battery status reporting. 
+        // Application settings for this test: 
+            // Device sends battery status message every 10min 
+            // Accelerometer running 100 readings a second in low power mode
+            // When movement event (sharp movement of device) is detected device (via interrupt)
+                // Device reports accelerometer data every 1 sec for 60 sec
+
+        // Starting test, Battery status log:
+            // { "percent": 91.90625,   "ts": 1570122607, "capacity": 1838 }
+        // Logs indicate battery low warning:
+            // { "percent": 9.5429688, "ts": 1570174808, "capacity": 191 }
+            //	------------------------
+            //	[Main] LOW BATTERY ALERT
+            //	[Main] Num Movement Events: 20
+            //	------------------------
+        // Last battery report log: 
+            // { "percent": 0.01171875, "ts": 1570191609, "capacity": 0 }
+            //	------------------------
+            //	[Main] LOW BATTERY ALERT
+            //	[Main] Num Movement Events: 20
+            //  ------------------------
+        // Last logs from the device with imp server timestamp
+            // 2019-10-04T12:20:10.938 +00:00	[Agent]	{ "percent": 0.01171875, "ts": 1570191609, "capacity": 0 }	
+            // 2019-10-04T12:20:10.938 +00:00	[Agent]	------------------------
+            // 2019-10-04T12:20:10.939 +00:00	[Agent]	[Main] LOW BATTERY ALERT
+            // 2019-10-04T12:20:10.939 +00:00	[Agent]	[Main] Num Movement Events: 20
+            // 2019-10-04T12:20:10.939 +00:00	[Agent]	------------------------
+            // 2019-10-04T12:29:06.171 +00:00	[Status]	Device disconnected
+
     }
 }
 
